@@ -12,6 +12,7 @@ import argparse
 import datetime as dt
 import os
 import sys
+import time
 from collections import deque
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -157,6 +158,29 @@ class ActivePool:
 
 def get_connection():
     return psycopg2.connect(os.environ["POSTGRES_URL"])
+
+
+def insert_batch_with_retry(conn, sql: str, rows: list[tuple], max_retries: int = 4):
+    """Executes a batched insert, transparently reconnecting and retrying on
+    a dropped connection — observed in practice against a hosted Postgres
+    provider's pooled endpoint during this exact long-running seed — rather
+    than losing all progress made so far. Returns the (possibly new)
+    connection for the caller to keep using."""
+    for attempt in range(max_retries):
+        try:
+            with conn.cursor() as cur:
+                psycopg2.extras.execute_values(cur, sql, rows)
+            conn.commit()
+            return conn
+        except psycopg2.OperationalError as e:
+            print(f"  connection error on attempt {attempt + 1}/{max_retries}: {e}. Reconnecting...")
+            try:
+                conn.close()
+            except Exception:
+                pass
+            time.sleep(2 ** attempt)
+            conn = get_connection()
+    raise RuntimeError(f"Failed to insert a batch of {len(rows)} rows after {max_retries} retries")
 
 
 def insert_zones(conn) -> dict[str, int]:
@@ -581,9 +605,7 @@ def generate_fact_deliveries(conn, rng, zone_name_to_id, zone_users, zone_mercha
                     ))
 
                     if len(buffer) >= BATCH_SIZE:
-                        with conn.cursor() as cur:
-                            psycopg2.extras.execute_values(cur, FACT_DELIVERIES_INSERT, buffer)
-                        conn.commit()
+                        conn = insert_batch_with_retry(conn, FACT_DELIVERIES_INSERT, buffer)
                         total_inserted += len(buffer)
                         buffer.clear()
 
@@ -592,12 +614,11 @@ def generate_fact_deliveries(conn, rng, zone_name_to_id, zone_users, zone_mercha
         current += dt.timedelta(days=1)
 
     if buffer:
-        with conn.cursor() as cur:
-            psycopg2.extras.execute_values(cur, FACT_DELIVERIES_INSERT, buffer)
-        conn.commit()
+        conn = insert_batch_with_retry(conn, FACT_DELIVERIES_INSERT, buffer)
         total_inserted += len(buffer)
 
     print(f"  inserted {total_inserted:,} fact_deliveries rows total")
+    return conn
 
 
 def main():
@@ -606,10 +627,21 @@ def main():
     parser.add_argument("--start-date", type=str, default=None, help="Override window start (YYYY-MM-DD)")
     parser.add_argument("--end-date", type=str, default=None, help="Override window end (YYYY-MM-DD), default today")
     parser.add_argument("--seed", type=int, default=SEED, help="Random seed for reproducibility")
+    parser.add_argument(
+        "--order-rate-scale", type=float, default=1.0,
+        help="Multiplier on BASE_ORDER_RATE (default 1.0). Used to fit smaller storage "
+             "budgets (e.g. Neon's free-tier 512MB cap) without changing zone/date scope "
+             "— same story, smaller absolute volume.",
+    )
     args = parser.parse_args()
 
     end_date = dt.date.fromisoformat(args.end_date) if args.end_date else dt.date.today()
     start_date = dt.date.fromisoformat(args.start_date) if args.start_date else end_date - dt.timedelta(days=365 * args.years)
+
+    if args.order_rate_scale != 1.0:
+        for tier in BASE_ORDER_RATE:
+            BASE_ORDER_RATE[tier] *= args.order_rate_scale
+        print(f"Scaled BASE_ORDER_RATE by {args.order_rate_scale}: {BASE_ORDER_RATE}")
 
     rng = np.random.default_rng(args.seed)
     conn = get_connection()
@@ -637,7 +669,7 @@ def main():
     weather_lut, events_df = insert_weather_and_events(conn, rng, zone_name_to_id, start_date, end_date)
 
     print("Generating fact_deliveries (this is the long-running step)...")
-    generate_fact_deliveries(
+    conn = generate_fact_deliveries(
         conn, rng, zone_name_to_id, zone_users, zone_merchants, zone_dashers,
         promos_by_merchant, platform_promos, weather_lut, events_df, start_date, end_date,
     )

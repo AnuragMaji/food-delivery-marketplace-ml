@@ -19,6 +19,17 @@ deployment, with a live link a reviewer can open without the author present.
 - **Delivery**: deployed with a live public link (not just local docker-compose).
 - **Streaming**: a Python consumer doing windowed aggregation on Redpanda
   (Kafka-API compatible). Real Kafka Streams (JVM) is an explicit future upgrade.
+- **Redpanda hosting**: no persistent hosted broker. Investigated Redpanda
+  Cloud's "Serverless" free tier and found it's a 30-day/$100-credit *trial*,
+  not a persistent free tier — clusters suspend after the trial and data is
+  permanently deleted after a 7-day grace period unless you add a card and
+  start paying. Since `producer.py` publishes and `consumer.py` consumes
+  within the same pipeline tick (nothing needs to persist *between* ticks),
+  Redpanda only needs to be alive for the ~30 seconds each scheduled run
+  takes — so it runs as a **GitHub Actions service container**, spun up
+  fresh for each cron-triggered workflow run and torn down when it
+  finishes. Zero persistent infrastructure, zero trial-expiry risk, and it
+  matches the actual usage pattern better than a hosted broker would.
 - **Pipeline trigger**: a scheduled batch job (GitHub Actions cron), not an
   always-on worker — each tick generates one "accelerated week" of data,
   fitting the project's compressed-time framing and keeping hosting near-free.
@@ -122,10 +133,24 @@ npx -y @mermaid-js/mermaid-cli -i docs/architecture.mmd -o docs/architecture.png
   the historical seed — comfortably within free-tier Postgres, fast to
   generate and train on locally. Final validated full 3-year run (42 zones,
   all growth/churn/issue features included): **5,569,206 rows**, ~180s CPU
-  time, plus accumulated realtime ticks since (currently 5,608,036+ and
-  growing). `BASE_ORDER_RATE` went through several empirical retuning passes
-  as growth/churn/lag effects were layered in (a naive first pass landed at
-  only 1.37M rows before a ~4.4x retune) — see the Growth/churn section below.
+  time locally, plus accumulated realtime ticks since. `BASE_ORDER_RATE`
+  went through several empirical retuning passes as growth/churn/lag effects
+  were layered in (a naive first pass landed at only 1.37M rows before a
+  ~4.4x retune) — see the Growth/churn section below.
+  **Deployed (Neon) scale is intentionally smaller**: Neon's free tier caps
+  a project at 512MB, which the full local-scale dataset does not fit in —
+  discovered directly (twice) via `psycopg2.OperationalError: could not
+  extend file because project size limit (512 MB) has been exceeded`.
+  `historical_generator.py` now takes `--order-rate-scale` (a multiplier on
+  `BASE_ORDER_RATE`, default 1.0) so the same zones/time-window/growth-curve
+  story can be reproduced at a smaller absolute volume without touching the
+  fully-validated local dataset or rewriting anything. Computed the scale
+  factor from the observed failure point (~280 bytes/row including 4
+  indexes, at the exact row count that hit 512MB) targeting a 300MB budget:
+  `--order-rate-scale 0.19`. Result: **1,059,324 rows, 280MB total database
+  size** — comfortable headroom under the cap for ongoing realtime ticks —
+  with the identical growth-then-maturity shape as the local dataset (just
+  ~19% the absolute volume) and the same 15.2% late rate.
 - **Realism check**: `PROMISED_ETA_BUFFER_MIN` (the padding added on top of
   prep+travel time to produce the "promised" ETA) was tuned from an initial
   5.0 to 8.0 after the real run showed a 40% late-delivery rate — the buffer
@@ -460,7 +485,7 @@ Not sourced from a real weather API (see Assumptions).
   (5,569,206 → 5,608,036 rows). This is the first time every stage from
   generation through Postgres has run together as one real pipeline.
 - **`features/feature_store.py`** — thin wrapper over the two feature
-  stores: `write_online`/`read_online` (Redis, keyed
+  stores: `write_online`/`write_online_batch`/`read_online` (Redis, keyed
   `feature:{entity_type}:{entity_id}:{feature_name}`), and
   `write_offline_snapshots`/`read_latest_offline_snapshot` (the
   `feature_snapshots` Postgres table — the *same* database as everything
@@ -488,6 +513,17 @@ Not sourced from a real weather API (see Assumptions).
   (re-running with no new data doesn't duplicate rows) and confirmed the
   point-in-time lookup correctly returns `None` for a date before any
   snapshot existed (no accidental future-leakage).
+  **Bug caught during deployment**: against local Docker Redis, writing
+  ~8,500 features took ~1.4s (later ~0.4s). Against Upstash (a real network
+  hop instead of localhost), the same run didn't finish inside a 60s
+  timeout — `write_online` did one individual `.set()` call per feature,
+  and thousands of individual network round trips is a fundamentally
+  different cost than thousands of in-memory operations. Fixed by adding
+  `write_online_batch` (a Redis pipeline — all writes batched into one
+  round trip) to `feature_store.py`; re-run completed in **4.7 seconds**.
+  This matters beyond just this one-time population: every future
+  scheduled pipeline tick calls this same function against the same remote
+  Redis.
 - **`ml/train_eta_model.py`** — trains a `HistGradientBoostingRegressor`
   (native categorical support, no one-hot encoding needed) to predict
   `actual_delivery_min`. Training features are computed with genuine
@@ -543,7 +579,7 @@ Not sourced from a real weather API (see Assumptions).
   `python:3.9-slim` to match the local dev Python version the model was
   actually pickled under, avoiding any risk of subtle pickle/numpy
   incompatibility across Python versions.
-  **Validated**: built and ran the real container via
+  **Validated locally**: built and ran the real container via
   `infra/docker-compose.yml`'s existing `model-api` service, connected to
   the already-running Postgres/Redis containers over the internal Docker
   network — `/health` responded correctly, and `/predict` against a real
@@ -551,6 +587,15 @@ Not sourced from a real weather API (see Assumptions).
   (non-Docker) test, confirming full consistency between dev and
   containerized environments. Both predictions correctly persisted to
   `fact_predictions`.
+  **Deployed and validated live**: on Render's free tier (750 hrs/month,
+  no card required — chosen over Fly.io, which dropped its free tier
+  entirely for new accounts in favor of usage-based billing from day one),
+  connected to Neon + Upstash via environment variables. `/health` and a
+  real `/predict` call both confirmed working at
+  `https://food-delivery-marketplace-ml.onrender.com` — first request took
+  ~44s (free-tier cold start after inactivity, expected), the next took
+  1.5s. The prediction persisted correctly to the live Neon database with
+  its full feature snapshot.
 - **`pipeline/run_batch.py`** — the orchestrator: runs one full accelerated
   tick end-to-end by invoking every stage above as its own subprocess (the
   exact same commands already validated by hand, not a reimplementation),

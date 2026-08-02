@@ -22,3 +22,6 @@ mlruns/
 
 # OS
 .DS_Store
+
+# editor
+.vscode/

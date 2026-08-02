@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from feature_store import get_pg_connection, get_redis_client, write_offline_snapshots, write_online
+from feature_store import get_pg_connection, get_redis_client, write_offline_snapshots, write_online_batch
 
 TRAILING_WINDOW_DAYS = 30
 
@@ -102,8 +102,9 @@ def main():
         + compute_zone_features(conn, as_of)
     )
 
-    for f in all_features:
-        write_online(redis_client, f["entity_type"], f["entity_id"], f["feature_name"], f["value"])
+    write_online_batch(redis_client, [
+        (f["entity_type"], f["entity_id"], f["feature_name"], f["value"]) for f in all_features
+    ])
 
     snapshot_rows = [
         (f["entity_type"], f["entity_id"], f["feature_name"], round(f["value"], 4), as_of)

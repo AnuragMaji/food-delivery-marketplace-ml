@@ -34,6 +34,20 @@ def write_online(redis_client: redis.Redis, entity_type: str, entity_id: int, fe
     redis_client.set(online_key(entity_type, entity_id, feature_name), value)
 
 
+def write_online_batch(redis_client: redis.Redis, entries: list[tuple[str, int, str, float]]):
+    """entries: (entity_type, entity_id, feature_name, value). Batches every
+    write into a single Redis pipeline (one round trip) instead of one
+    round trip per feature — matters a lot once Redis is remote (e.g.
+    Upstash): thousands of individual .set() calls each pay real network
+    latency, turning a sub-2-second local job into a many-minute one."""
+    if not entries:
+        return
+    pipe = redis_client.pipeline(transaction=False)
+    for entity_type, entity_id, feature_name, value in entries:
+        pipe.set(online_key(entity_type, entity_id, feature_name), value)
+    pipe.execute()
+
+
 def read_online(redis_client: redis.Redis, entity_type: str, entity_id: int, feature_name: str) -> float | None:
     raw = redis_client.get(online_key(entity_type, entity_id, feature_name))
     return float(raw) if raw is not None else None
