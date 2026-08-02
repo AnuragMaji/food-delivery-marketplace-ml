@@ -1,0 +1,24 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# model artifacts (except the one model_api actually serves — Docker builds
+# from a fresh GitHub checkout need it committed, or the image build fails)
+*.joblib
+*.pkl
+!ml/model_api/model.joblib
+
+# great expectations local output
+contracts/expectations/uncommitted/
+great_expectations/uncommitted/
+
+# mlflow local tracking store
+mlruns/
+
+# streamlit
+.streamlit/secrets.toml
+
+# OS
+.DS_Store

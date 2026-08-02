@@ -1,0 +1,66 @@
+%%{init: {"flowchart": {"nodeSpacing": 35, "rankSpacing": 55}}}%%
+flowchart TD
+    subgraph ORCH["Scheduler"]
+        CRON["Every 10-15 minutes, GitHub Actions<br/>runs pipeline/run_batch.py, which does<br/>the numbered steps below, one after another"]
+    end
+
+    subgraph GEN["Step 1: Make up new data (Python)"]
+        RT["realtime_generator.py<br/>Invents one simulated week<br/>of new orders"]
+        HIST["historical_generator.py<br/>Ran once, up front:<br/>built about 3 years of history"]
+    end
+
+    subgraph STREAM["Step 2: Publish and pick up the new orders (Redpanda)"]
+        PROD["producer.py<br/>Publishes the new orders<br/>as messages"]
+        TOPIC["Message queue:<br/>deliveries.raw"]
+        CONS["consumer.py<br/>Picks up new messages,<br/>tallies quick stats"]
+    end
+
+    subgraph QUALITY["Step 3: Check the data is trustworthy (Great Expectations)"]
+        GE["validate_batch.py<br/>Rejects rows with missing<br/>fields or impossible values"]
+        QUAR[("deliveries_quarantine<br/>Rejected rows,<br/>with the reason why")]
+    end
+
+    subgraph CLEAN["Step 4: Clean it up"]
+        PREP["preprocess.py<br/>Removes duplicates, fills<br/>gaps, caps extreme values"]
+    end
+
+    subgraph PGBOX["Central database (Postgres)"]
+        PG[("users, merchants, dashers, zones,<br/>orders, weather, promotions,<br/>predictions")]
+    end
+
+    subgraph FEATURES["Step 5: Summarize history into signals a model can use"]
+        BATCHF["batch_features.py<br/>e.g. this dasher's average<br/>delivery time, last 30 days<br/>(hand-rolled, not a Feast/Tecton-style library)"]
+        REDIS[("Redis<br/>Fast lookup copy, used the<br/>moment a prediction is needed")]
+        SNAP[("feature_snapshots table<br/>Same Postgres database as<br/>above, just a different table —<br/>keeps feature history for training")]
+    end
+
+    subgraph MODEL["Step 6: Predict delivery time"]
+        TRAIN["train_eta_model.py<br/>Trains on historical data<br/>(run occasionally, not every tick)"]
+        MLFLOW[("MLflow<br/>Logs each training run:<br/>parameters, metrics, model version")]
+        API["model_api (Docker container)<br/>A small web service that<br/>predicts one delivery's ETA"]
+    end
+
+    subgraph SERVE["What a person actually sees"]
+        UI["Streamlit dashboard<br/>Live counts, prediction<br/>accuracy, data-quality panel"]
+    end
+
+    CRON --> RT
+    HIST -->|"bulk load, done once,<br/>skips the checks"| PG
+    RT --> PROD
+    PROD --> TOPIC
+    TOPIC --> CONS
+    CONS -->|"new orders"| GE
+    CONS -.->|"running totals"| REDIS
+    GE -->|"looks fine"| PREP
+    GE -.->|"looks wrong"| QUAR
+    PREP --> PG
+    PG -.->|"read past orders"| BATCHF
+    BATCHF --> REDIS
+    BATCHF --> SNAP
+    SNAP -.->|"training data"| TRAIN
+    TRAIN -.->|"logs the run"| MLFLOW
+    TRAIN -.->|"trained model"| API
+    REDIS -.->|"latest signals"| API
+    API -.->|"saves its guess"| PG
+    PG --> UI
+    REDIS --> UI
