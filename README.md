@@ -370,7 +370,7 @@ Not sourced from a real weather API (see Assumptions).
 | `features/` | Feature engineering | Built | `batch_features.py` (computes rolling features from Postgres), `feature_store.py` (Redis online + `feature_snapshots` offline wrapper) |
 | `ml/` | Model training + serving | Built | `train_eta_model.py` (scikit-learn + MLflow), `model_api/` (FastAPI app, Dockerfile, `model.joblib` artifact) |
 | `pipeline/` | Orchestration + cleanup | Built | `preprocess.py` (dedup/impute/clip/load into `fact_deliveries`); `run_batch.py` (the single entrypoint wiring generate → publish → consume → validate → clean → feature → predict into one tick) |
-| `ui/` | Dashboard | Built, visual review pending | `app.py` (Streamlit — KPIs, growth trend, zone demand, predicted-vs-actual, data-quality panel, manual pipeline trigger) |
+| `ui/` | Dashboard | Built and deployed | `app.py` (Streamlit — KPIs, growth trend, zone demand, predicted-vs-actual, model monitoring, data overview, data-quality panel, manual pipeline trigger), `requirements.txt` (dashboard-specific deps) |
 | `.github/workflows/` | Scheduling | Planned | `pipeline.yml` (GitHub Actions cron, drives the realtime pipeline every ~10-15 min) |
 | `docs/` | Documentation assets | Built | `architecture.mmd` (editable Mermaid source for the system diagram), `architecture.png` (rendered static image, embedded in this README for consistent display everywhere) |
 | *(repo root)* | Project config & docs | Built | `requirements.txt`, `.env` / `.env.example`, `.gitignore`, `README.md` |
@@ -665,9 +665,27 @@ Not sourced from a real weather API (see Assumptions).
   throughout: 5.6M+ deliveries, sensible predictions, live metrics matching
   the last pipeline run exactly, the weather/MAE finding above, zero
   quarantine handled gracefully. The server boots and serves successfully.
-  **Not yet verified**: actual visual rendering — this environment doesn't
-  have a headless-browser tool available, so chart layout/spacing/color
-  rendering needs a human look before this is considered fully done.
+  Visual rendering (this environment has no headless-browser tool) was
+  confirmed by hand: KPIs, charts, and the model-monitoring section all
+  render correctly with real data both locally and in production.
+  **Deployed to Streamlit Community Cloud**:
+  [live dashboard](https://food-delivery-marketplace-ml-mtktavff5n8q9abcyt7wjm.streamlit.app),
+  connected to Neon + Upstash via the platform's secrets store.
+  **Bug caught during this deployment**: the app got stuck "in the oven"
+  (Streamlit Cloud's build-in-progress state) indefinitely. Root cause,
+  confirmed from the actual build log: Streamlit Cloud was building against
+  Python 3.14, and the project's pinned `numpy==1.26.4`/`pandas==2.2.2`
+  (from early 2024, predating Python 3.14) have no prebuilt wheels for it —
+  pip fell back to compiling both from source, which is slow and was
+  further slowed by installing the *entire* project's `requirements.txt`
+  (scikit-learn, MLflow, kafka-python, Great Expectations — none of which
+  `ui/app.py` actually imports) rather than just what the dashboard needs.
+  Fixed with a dashboard-specific `ui/requirements.txt` (flexible `>=`
+  version constraints, only the six packages the dashboard actually uses) —
+  Streamlit Cloud gives a requirements file in the entrypoint's own
+  directory priority over the repo-root one, so this didn't require
+  reorganizing anything. Rebuilt successfully; confirmed showing real,
+  correct data end-to-end in a real browser.
 
 ## Growth, churn & entity heterogeneity
 
