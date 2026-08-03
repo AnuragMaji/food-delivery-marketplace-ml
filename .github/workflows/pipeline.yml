@@ -1,0 +1,67 @@
+name: Pipeline tick
+
+# Runs one full accelerated-week pipeline tick (pipeline/run_batch.py):
+# generate -> publish/consume via Redpanda -> validate -> clean/load -> features
+# -> score predictions -> prune old data.
+#
+# Redpanda has no persistent hosted broker (see README's Architecture decisions
+# table) — it's started fresh in this job as a plain `docker run` (not the
+# `services:` block, which doesn't support Redpanda's custom start command) and
+# torn down when the job finishes. Postgres (Neon) and Redis (Upstash) are
+# already-hosted, reached over the network via secrets.
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"  # every 6 hours
+  workflow_dispatch: {}
+
+jobs:
+  run-tick:
+    runs-on: ubuntu-latest
+    env:
+      POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+      REDIS_URL: ${{ secrets.REDIS_URL }}
+      MODEL_API_URL: ${{ secrets.MODEL_API_URL }}
+      REDPANDA_BROKERS: localhost:9092
+      DELIVERIES_TOPIC: deliveries.raw
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Start Redpanda (ephemeral — this run only)
+        run: |
+          docker run -d --name redpanda -p 9092:9092 \
+            redpandadata/redpanda:v24.1.10 \
+            redpanda start --smp=1 --overprovisioned --node-id=0 --check=false \
+            --kafka-addr=PLAINTEXT://0.0.0.0:9092 \
+            --advertise-kafka-addr=PLAINTEXT://localhost:9092
+
+      - name: Wait for Redpanda to be ready
+        run: |
+          for i in $(seq 1 30); do
+            if docker exec redpanda rpk cluster health 2>/dev/null | grep -q "Healthy:.*true"; then
+              echo "Redpanda is healthy."
+              exit 0
+            fi
+            echo "Waiting for Redpanda... ($i/30)"
+            sleep 2
+          done
+          echo "Redpanda did not become healthy in time."
+          docker logs redpanda
+          exit 1
+
+      - name: Run pipeline tick
+        run: python pipeline/run_batch.py
+
+      - name: Stop Redpanda
+        if: always()
+        run: docker rm -f redpanda

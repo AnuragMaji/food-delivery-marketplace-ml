@@ -9,8 +9,6 @@ Run locally:
 from __future__ import annotations
 
 import os
-import subprocess
-import sys
 from pathlib import Path
 
 import pandas as pd
@@ -18,26 +16,62 @@ import plotly.express as px
 import plotly.graph_objects as go
 import psycopg2
 import redis
+import requests
 import streamlit as st
 from dotenv import load_dotenv
 
 load_dotenv()
 
+_MISSING = object()
 
-def get_config(key: str) -> str:
+
+def get_config(key: str, default=_MISSING) -> str:
     """Prefers Streamlit Cloud's secrets store when configured (production),
     falls back to .env/os.environ (local dev). st.secrets raises
     FileNotFoundError on any access at all when no secrets.toml exists
     (not just a missing key), so this must be a try/except, not a
-    dict-style .get() with a default."""
+    dict-style .get() with a default. Pass `default` for optional keys
+    (e.g. GH_PAT) — omit it for required keys, which raise KeyError."""
     try:
         if key in st.secrets:
             return st.secrets[key]
     except Exception:
         pass
-    return os.environ[key]
+    if default is _MISSING:
+        return os.environ[key]
+    return os.environ.get(key, default)
 
 REPO_ROOT = Path(__file__).parent.parent
+
+GITHUB_REPO = "AnuragMaji/food-delivery-marketplace-ml"
+GITHUB_WORKFLOW_FILE = "pipeline.yml"
+GITHUB_BRANCH = "main"
+
+
+def trigger_github_workflow() -> tuple[bool, str]:
+    """Kicks off the same pipeline.yml GitHub Actions workflow the cron
+    schedule uses (workflow_dispatch), rather than running the pipeline
+    in-process here — this dashboard's host has no Redpanda broker and no
+    kafka-python installed (ui/requirements.txt is deliberately slim), so
+    the pipeline can only actually run inside that workflow's job."""
+    token = get_config("GH_PAT", None)
+    if not token:
+        return False, "GH_PAT isn't configured in this app's secrets."
+    try:
+        resp = requests.post(
+            f"https://api.github.com/repos/{GITHUB_REPO}/actions/workflows/{GITHUB_WORKFLOW_FILE}/dispatches",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+            },
+            json={"ref": GITHUB_BRANCH},
+            timeout=10,
+        )
+    except requests.RequestException as e:
+        return False, f"GitHub API call failed: {e}"
+    if resp.status_code == 204:
+        return True, ""
+    return False, f"GitHub API returned {resp.status_code}: {resp.text[:300]}"
 
 # Reference palette (dataviz skill) — sequential blue for magnitude, status
 # colors reserved for the data-quality panel, never reused as series colors.
@@ -277,21 +311,16 @@ with st.sidebar:
         "This simulated marketplace's clock moves faster than real time: each click "
         "below invents roughly **one week** of new simulated orders and runs them "
         "through the full pipeline (generate → publish → validate → clean → "
-        "recompute features → score predictions), in about 30 seconds."
+        "recompute features → score predictions), by triggering the same GitHub "
+        "Actions workflow the scheduled cron uses. It takes about 1-2 minutes — "
+        "refresh this page shortly after to see the new data."
     )
     if st.button("Generate next simulated week", type="primary"):
-        with st.spinner("Running one full pipeline cycle (generate → validate → clean → features → predict)... ~30s"):
-            result = subprocess.run(
-                [sys.executable, "pipeline/run_batch.py"], cwd=REPO_ROOT,
-                capture_output=True, text=True,
-            )
-        if result.returncode == 0:
-            st.success("Tick complete.")
-            st.cache_data.clear()
-            st.rerun()
+        triggered, message = trigger_github_workflow()
+        if triggered:
+            st.success("Triggered! Check back in a minute or two, then refresh.")
         else:
-            st.error("Pipeline run failed — see logs.")
-            st.code(result.stderr[-2000:])
+            st.error(f"Couldn't trigger the pipeline — {message}")
 
 # --- KPI row --------------------------------------------------------------
 

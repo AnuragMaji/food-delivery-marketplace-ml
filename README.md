@@ -8,6 +8,19 @@ store, a containerized model service, and a live dashboard.
 This document is maintained incrementally as the project is built, so it
 always reflects current state — not a retrospective writeup.
 
+## Table of contents
+
+- [Purpose & audience](#purpose--audience)
+- [Architecture decisions](#architecture-decisions)
+- [System architecture](#system-architecture)
+- [Assumptions](#assumptions)
+- [Scale target](#scale-target)
+- [Data Dictionary](#data-dictionary)
+- [Folder structure](#folder-structure)
+- [What each file does](#what-each-file-does-updated-as-files-are-added)
+- [Growth, churn & entity heterogeneity](#growth-churn--entity-heterogeneity)
+- [Deferred to later phases](#deferred-to-later-phases-not-built-in-v1)
+
 ## Purpose & audience
 
 Built as a portfolio piece to demonstrate end-to-end ML/data engineering
@@ -16,30 +29,42 @@ deployment, with a live link a reviewer can open without the author present.
 
 ## Architecture decisions
 
-- **Delivery**: deployed with a live public link (not just local docker-compose).
-- **Streaming**: a Python consumer doing windowed aggregation on Redpanda
-  (Kafka-API compatible). Real Kafka Streams (JVM) is an explicit future upgrade.
-- **Redpanda hosting**: no persistent hosted broker. Investigated Redpanda
-  Cloud's "Serverless" free tier and found it's a 30-day/$100-credit *trial*,
-  not a persistent free tier — clusters suspend after the trial and data is
-  permanently deleted after a 7-day grace period unless you add a card and
-  start paying. Since `producer.py` publishes and `consumer.py` consumes
-  within the same pipeline tick (nothing needs to persist *between* ticks),
-  Redpanda only needs to be alive for the ~30 seconds each scheduled run
-  takes — so it runs as a **GitHub Actions service container**, spun up
-  fresh for each cron-triggered workflow run and torn down when it
-  finishes. Zero persistent infrastructure, zero trial-expiry risk, and it
-  matches the actual usage pattern better than a hosted broker would.
-- **Pipeline trigger**: a scheduled batch job (GitHub Actions cron), not an
-  always-on worker — each tick generates one "accelerated week" of data,
-  fitting the project's compressed-time framing and keeping hosting near-free.
-- **UI**: Streamlit, for build speed.
-- **Data model**: a proper star schema (fact + dimension tables), not a flat
-  orders table — see the Data Dictionary below.
-- **ML lifecycle**: explicit preprocessing/cleanup, Great Expectations data
-  contracts, feature engineering, a feature store (online + offline), then
-  prediction — modeled as a bronze → contract gate → silver → features →
-  predictions ("gold") pipeline.
+Every major technology choice, why it was picked, and what else was
+considered. Items marked "see below" have a full deep-dive (including bugs
+hit and how they were fixed) later in this doc — this table is the scannable
+index, not the whole story.
+
+| Layer | Chosen | Why | Alternatives considered |
+|---|---|---|---|
+| Data generation | Python (numpy/pandas), custom generators | Full control over growth/churn/seasonality modeling specific to a delivery marketplace | Faker/Mockaroo — too generic, no domain-specific dynamics |
+| Data warehouse | **[Neon](https://neon.tech)** (hosted Postgres) | Serverless Postgres, fast setup; see below for the real 512MB free-tier limit hit and fix | **Supabase** — equally good fit, bundles unused auth/storage features; **AWS RDS** — 20GB free but only for 12 months + VPC/security-group setup; **Databricks** — wrong tool entirely, built for Spark/OLAP analytics, not a transactional app database |
+| Online cache / feature store (online half) | **[Upstash](https://upstash.com)** (hosted Redis) | Serverless Redis, simple TLS connection string, generous free tier | **Redis Cloud** (Redis Inc.'s own offering, similar fit); **AWS ElastiCache** — no meaningful free tier, VPC complexity |
+| Streaming broker | Redpanda — self-hosted via Docker locally; **GitHub Actions service container** in production (see below) | Kafka-API compatible without JVM/ZooKeeper overhead; avoids needing *any* persistent hosting at all | **Redpanda Cloud Serverless** — looked free, is actually a 30-day/$100-credit trial that deletes data after a grace period (see below); **Upstash Kafka**; a small always-on VM (real recurring cost for something not needed 24/7) |
+| Stream processing | Python consumer (`kafka-python`) | Fast to build for this scope | Kafka Streams / ksqlDB — JVM, more "production-grade" but much heavier to stand up |
+| Data contracts | Great Expectations | The specific tool requested; industry-standard expectation suites | Pandera (lighter, dataframe-native); dbt tests; Soda Core |
+| Feature store | Hand-rolled (Redis online + Postgres `feature_snapshots` offline) | Demonstrates the online/offline split concept without an extra library's learning curve | Feast — a real feature-store library, deliberately deferred to v2 |
+| Experiment tracking | MLflow (local tracking store) | Low implementation cost, industry-standard, resume-relevant | Weights & Biases — nicer UI, needs its own cloud account; Neptune.ai |
+| Model | scikit-learn `HistGradientBoostingRegressor` | Native categorical support (no one-hot encoding), fast, no extra dependency | XGBoost/LightGBM — marginal gains, extra dependency; a neural net — overkill for this data's size/shape |
+| Model serving | FastAPI + Docker | Async-capable, self-documenting (OpenAPI/Swagger) | Flask — less async-native; Django REST Framework — too heavy for one endpoint |
+| Model hosting | **[Render](https://render.com)** (see below) | Genuine persistent free tier (750 hrs/month), no card required, solid Docker support | **Fly.io** — dropped its free tier for new accounts, now $5+/mo from day one; AWS/GCP — real cost + much more setup |
+| Dashboard | Streamlit | Fastest path to a real interactive dashboard in pure Python | A custom React/Next.js app — more polished, far more build time |
+| Dashboard hosting | **[Streamlit Community Cloud](https://streamlit.io/cloud)** (see below) | Free, deploys straight from GitHub, zero server management | Hosting it as another Render service — works, but Streamlit Cloud is purpose-built and free |
+| Orchestration/scheduling | GitHub Actions cron (every 6h) + on-demand `workflow_dispatch` from the dashboard button | Free for a public repo, lives with the code, no separate infra | A dedicated always-on worker — real recurring cost for something that only runs briefly a few times a day |
+| Storage growth control | Rolling 2-year retention window, pruned every tick (`pipeline/prune_old_data.py`) | A single measured tick added 40,410 rows (~2MB at Neon's scaled-down population) — unpruned, recurring ticks would re-exhaust Neon's 512MB cap within days | Just running the cron infrequently (buys weeks/months, doesn't solve it); a bigger paid Neon tier |
+| Containerization | Docker + docker-compose (local); Docker (production `model_api`) | Universal standard, directly resume-relevant | Kubernetes — deferred, genuine overkill at this scale (documented future phase) |
+| Version control / CI | GitHub + GitHub Actions | Ubiquitous, recruiter-familiar, native integration with Streamlit Cloud/Render's GitHub-based deploys | GitLab/Bitbucket — equally valid, less universally expected |
+
+**Pipeline trigger**: a scheduled batch job (GitHub Actions cron), not an
+always-on worker — each tick generates one "accelerated week" of data,
+fitting the project's compressed-time framing and keeping hosting near-free.
+
+**Data model**: a proper star schema (fact + dimension tables), not a flat
+orders table — see the [Data Dictionary](#data-dictionary) below.
+
+**ML lifecycle**: explicit preprocessing/cleanup, Great Expectations data
+contracts, feature engineering, a feature store (online + offline), then
+prediction — modeled as a bronze → contract gate → silver → features →
+predictions ("gold") pipeline.
 
 ## System architecture
 
@@ -369,9 +394,9 @@ Not sourced from a real weather API (see Assumptions).
 | `streaming/` | Stream processing | Built | `producer.py` (publishes batches to Redpanda), `consumer.py` (windowed aggregation into Redis) |
 | `features/` | Feature engineering | Built | `batch_features.py` (computes rolling features from Postgres), `feature_store.py` (Redis online + `feature_snapshots` offline wrapper) |
 | `ml/` | Model training + serving | Built | `train_eta_model.py` (scikit-learn + MLflow), `model_api/` (FastAPI app, Dockerfile, `model.joblib` artifact) |
-| `pipeline/` | Orchestration + cleanup | Built | `preprocess.py` (dedup/impute/clip/load into `fact_deliveries`); `run_batch.py` (the single entrypoint wiring generate → publish → consume → validate → clean → feature → predict into one tick) |
+| `pipeline/` | Orchestration + cleanup | Built | `preprocess.py` (dedup/impute/clip/load into `fact_deliveries`); `run_batch.py` (the single entrypoint wiring generate → publish → consume → validate → clean → feature → predict → prune into one tick); `prune_old_data.py` (rolling retention window, keeps storage flat) |
 | `ui/` | Dashboard | Built and deployed | `app.py` (Streamlit — KPIs, growth trend, zone demand, predicted-vs-actual, model monitoring, data overview, data-quality panel, manual pipeline trigger), `requirements.txt` (dashboard-specific deps) |
-| `.github/workflows/` | Scheduling | Planned | `pipeline.yml` (GitHub Actions cron, drives the realtime pipeline every ~10-15 min) |
+| `.github/workflows/` | Scheduling | Built | `pipeline.yml` (cron every 6h + on-demand `workflow_dispatch`; starts Redpanda as an ephemeral `docker run` for the job's duration, then runs `pipeline/run_batch.py`) |
 | `docs/` | Documentation assets | Built | `architecture.mmd` (editable Mermaid source for the system diagram), `architecture.png` (rendered static image, embedded in this README for consistent display everywhere) |
 | *(repo root)* | Project config & docs | Built | `requirements.txt`, `.env` / `.env.example`, `.gitignore`, `README.md` |
 
@@ -607,7 +632,20 @@ Not sourced from a real weather API (see Assumptions).
   rather than failing the whole tick. `preprocess.py` was extended
   (`RETURNING delivery_id`) so the orchestrator knows exactly which
   deliveries this tick actually inserted, rather than guessing from
-  timestamps.
+  timestamps. A final step calls `prune_old_data.py` (below) so recurring
+  ticks don't grow storage without bound.
+- **`pipeline/prune_old_data.py`** — deletes `fact_deliveries` (and dependent
+  `fact_predictions`, which has no `ON DELETE CASCADE`) and `feature_snapshots`
+  rows older than a rolling retention window (default 2 years), keyed off the
+  latest *simulated* `order_ts` already in the table rather than wall-clock
+  time. Exists because a real accelerated week measured **40,410 rows in a
+  single tick** — at even a modest cron cadence that would re-exhaust Neon's
+  512MB free-tier cap (the same wall hit during the original historical
+  seed) within days. Validated locally: pruning against the 5.68M-row local
+  dataset with a 730-day window correctly kept exactly the trailing 2-year
+  slice (3.89M rows remaining, date range collapsed to exactly 2 years wide);
+  a subsequent real tick (+40,410 new / -77,415 pruned) confirmed the window
+  keeps sliding forward instead of growing.
   **Validated end-to-end for real** (not a dry run): one full tick — generate
   → publish → consume → validate → clean/load → recompute features → score
   predictions — completed in **32.7 seconds** with zero errors: 39,239 new
@@ -645,8 +683,15 @@ Not sourced from a real weather API (see Assumptions).
   - **Data quality panel**: contract pass rate + quarantine-reason
     breakdown, using status colors (green/amber/red) reserved for this,
     never reused as a series color.
-  A sidebar button runs `pipeline/run_batch.py` live and refreshes the
-  page. Colors/chart-form choices follow the project's dataviz skill:
+  A sidebar button triggers the `pipeline.yml` GitHub Actions workflow
+  on demand (via the GitHub API's `workflow_dispatch`, using a repo-scoped
+  PAT in Streamlit secrets) — not a local subprocess. The dashboard's own
+  host has no Redpanda broker and deliberately doesn't have `kafka-python`
+  installed (`ui/requirements.txt` is slim on purpose, see below), so
+  running the pipeline in-process there always failed with
+  `ModuleNotFoundError: No module named 'kafka'`; triggering the real
+  workflow reuses the one pipeline code path instead of adding a second,
+  broken one. Colors/chart-form choices follow the project's dataviz skill:
   sequential blue for magnitude, status colors only for data quality, never
   a dual-axis chart.
   **Bugs caught before deployment**: (1) `st.secrets.get(key, default)`

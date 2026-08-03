@@ -25,3 +25,6 @@ mlruns/
 
 # editor
 .vscode/
+
+# private reference doc — connection strings/URLs, never committed
+DEPLOYMENT_CREDENTIALS.md

@@ -7,6 +7,8 @@ together every stage already built:
   4. Clean + load into fact_deliveries (pipeline/preprocess.py)
   5. Recompute features into Redis + feature_snapshots (features/batch_features.py)
   6. Score ETA predictions for a sample of the newly-landed deliveries (model_api)
+  7. Prune data older than a rolling retention window (pipeline/prune_old_data.py)
+     — keeps storage roughly flat forever as the accelerated clock advances
 
 Each stage runs as its own subprocess — the exact same commands already
 validated by hand — rather than importing everything into one process, so
@@ -78,6 +80,8 @@ def main():
     parser.add_argument("--max-predictions", type=int, default=DEFAULT_MAX_PREDICTIONS,
                          help="Max new deliveries to score with model_api per tick (default 300)")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for the generator (default: nondeterministic)")
+    parser.add_argument("--retention-days", type=int, default=730,
+                         help="Rolling retention window in days for the prune step (default 730 = 2 years)")
     args = parser.parse_args()
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -111,6 +115,10 @@ def main():
             score_predictions(delivery_ids, args.max_predictions)
         else:
             print("  no inserted-ids file found — skipping scoring.")
+
+        run_step("Step 7: Prune old data", [
+            "pipeline/prune_old_data.py", "--retention-days", str(args.retention_days),
+        ])
 
     print(f"\nTick '{batch_id}' complete.")
 
